@@ -16,8 +16,9 @@ builder.Host.UseSerilog((ctx, cfg) => cfg
 
 builder.Services.AddDbContext<GeoDbContext>(opt =>
     opt.UseNpgsql(
-        builder.Configuration.GetConnectionString("Default"),
-        npgsql => npgsql.UseNetTopologySuite()));
+            builder.Configuration.GetConnectionString("Default"),
+            npgsql => npgsql.UseNetTopologySuite())
+        .UseSnakeCaseNamingConvention());
 
 builder.Services.AddControllers()
     .ConfigureApiBehaviorOptions(opt => opt.SuppressMapClientErrors = false);
