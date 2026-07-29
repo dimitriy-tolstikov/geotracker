@@ -30,21 +30,29 @@ public class TrackQueryService(GeoDbContext db) : ITrackQueryService
         // Envelope(minX, maxX, minY, maxY) → Polygon с SRID 4326 (фабрика из GeoDbContext)
         var bbox = GeoDbContext.GeometryFactory.ToGeometry(new Envelope(minLon, maxLon, minLat, maxLat));
 
+        // Проецируем сущности (NTS Point): ST_X/ST_Y над geography не существуют,
+        // координаты (Location.Y/X) читаем в памяти после материализации.
         var query =
             from o in db.TrackedObjects
             join p in LatestPoints() on o.Id equals p.ObjectId
             where p.Location.Intersects(bbox)
-            select new TrackedObjectDto(
-                o.Id, o.Name, o.ExternalId, o.Kind, o.CreatedAt,
-                p.Location.Y, p.Location.X, p.RecordedAt);
+            select new { o, p };
 
         var total = await query.CountAsync(ct);
-        var items = await query
-            .OrderBy(x => x.Name)
-            .ThenBy(x => x.Id)
+        // Сортировка — в SQL и ДО проекции в DTO (на полях сущности)
+        var rows = await query
+            .AsNoTracking()
+            .OrderBy(x => x.o.Name)
+            .ThenBy(x => x.o.Id)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);
+
+        var items = rows
+            .Select(x => new TrackedObjectDto(
+                x.o.Id, x.o.Name, x.o.ExternalId, x.o.Kind, x.o.CreatedAt,
+                x.p.Location.Y, x.p.Location.X, x.p.RecordedAt))
+            .ToList();
 
         return new PagedResult<TrackedObjectDto>(items, page, pageSize, total);
     }
@@ -60,12 +68,17 @@ public class TrackQueryService(GeoDbContext db) : ITrackQueryService
             query = query.Where(p => p.RecordedAt <= to.Value);
 
         var total = await query.CountAsync(ct);
-        var items = await query
+        // Материализуем точки, DTO маппим в памяти (ST_X/ST_Y над geography не транслируется)
+        var points = await query
+            .AsNoTracking()
             .OrderBy(p => p.RecordedAt)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(p => new TrackPointDto(p.Location.Y, p.Location.X, p.Speed, p.Heading, p.RecordedAt))
             .ToListAsync(ct);
+
+        var items = points
+            .Select(p => new TrackPointDto(p.Location.Y, p.Location.X, p.Speed, p.Heading, p.RecordedAt))
+            .ToList();
 
         return new PagedResult<TrackPointDto>(items, page, pageSize, total);
     }
@@ -75,17 +88,23 @@ public class TrackQueryService(GeoDbContext db) : ITrackQueryService
     {
         var center = GeoDbContext.CreatePoint(lon, lat);
 
-        // IsWithinDistance → ST_DWithin (geography, метры); Distance → ST_Distance (метры)
-        return await (
+        // IsWithinDistance → ST_DWithin (geography, метры); Distance → ST_Distance (метры).
+        // Сортировка по Distance — в SQL; координаты читаем в памяти после материализации.
+        var rows = await (
             from o in db.TrackedObjects
             join p in LatestPoints() on o.Id equals p.ObjectId
             where p.Location.IsWithinDistance(center, radiusMeters)
             orderby p.Location.Distance(center)
-            select new TrackedObjectDto(
-                o.Id, o.Name, o.ExternalId, o.Kind, o.CreatedAt,
-                p.Location.Y, p.Location.X, p.RecordedAt))
+            select new { o, p })
+            .AsNoTracking()
             .Take(limit)
             .ToListAsync(ct);
+
+        return rows
+            .Select(x => new TrackedObjectDto(
+                x.o.Id, x.o.Name, x.o.ExternalId, x.o.Kind, x.o.CreatedAt,
+                x.p.Location.Y, x.p.Location.X, x.p.RecordedAt))
+            .ToList();
     }
 
     public async Task<PagedResult<ZoneEventDto>> GetEventsAsync(
@@ -106,14 +125,14 @@ public class TrackQueryService(GeoDbContext db) : ITrackQueryService
                 ZoneName = e.Zone != null ? e.Zone.Name : string.Empty,
                 e.Type,
                 e.OccurredAt,
-                Lat = e.Location.Y,
-                Lon = e.Location.X
+                e.Location // NTS Point: Lat/Lon читаем в памяти (ST_X/ST_Y над geography нет)
             })
             .ToListAsync(ct);
 
         var items = rows
             .Select(r => new ZoneEventDto(
-                r.Id, r.ZoneId, r.ZoneName, r.Type.ToString(), r.OccurredAt, r.Lat, r.Lon))
+                r.Id, r.ZoneId, r.ZoneName, r.Type.ToString(), r.OccurredAt,
+                r.Location.Y, r.Location.X))
             .ToList();
 
         return new PagedResult<ZoneEventDto>(items, page, pageSize, total);

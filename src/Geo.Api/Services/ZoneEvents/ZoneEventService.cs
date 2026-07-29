@@ -28,17 +28,16 @@ public class ZoneEventService(GeoDbContext db) : IZoneEventService
         if (zones.Count == 0)
             return Array.Empty<ZoneEventDto>();
 
-        // Последнее событие объекта по каждой зоне
-        var events = await db.ZoneEvents
-            .Where(e => e.ObjectId == objectId)
-            .Select(e => new { e.ZoneId, e.Type, e.OccurredAt })
+        // Последнее событие объекта по каждой зоне — в SQL (не грузим всю историю):
+        // GroupBy ZoneId → First после OrderByDescending транслируется EF Core в lateral join.
+        var zoneIds = zones.Select(z => z.Id).ToList();
+        var lastEvents = await db.ZoneEvents
+            .Where(e => e.ObjectId == objectId && zoneIds.Contains(e.ZoneId))
+            .GroupBy(e => e.ZoneId)
+            .Select(g => g.OrderByDescending(e => e.OccurredAt).First())
             .ToListAsync(ct);
 
-        var lastTypeByZone = events
-            .GroupBy(e => e.ZoneId)
-            .ToDictionary(
-                g => g.Key,
-                g => g.OrderByDescending(e => e.OccurredAt).First().Type);
+        var lastTypeByZone = lastEvents.ToDictionary(e => e.ZoneId, e => e.Type);
 
         var created = new List<ZoneEvent>();
         foreach (var zone in zones)

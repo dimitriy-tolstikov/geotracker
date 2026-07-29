@@ -154,7 +154,11 @@ public class TrackSimulatorService : BackgroundService
         return (lat, lon);
     }
 
-    /// <summary>Случайное блуждание: heading ±30°, шаг 30–80 м за тик (1 сек) → скорость = dist м/с.</summary>
+    /// <summary>
+    /// Случайное блуждание: heading ±30°, шаг 30–80 м за тик (1 сек) → скорость = dist м/с.
+    /// Позиция ограничена (clamp) квадратом Center ± SpreadDeg, чтобы дрейф не уводил
+    /// объект за границы (и COPY не падал на невалидных координатах).
+    /// </summary>
     private void Move(SimObject obj)
     {
         obj.Heading = (obj.Heading + (_random.NextDouble() * 60.0 - 30.0) + 360.0) % 360.0;
@@ -163,9 +167,11 @@ public class TrackSimulatorService : BackgroundService
 
         var rad = obj.Heading * Math.PI / 180.0;
         var dLat = dist * Math.Cos(rad) / MetersPerDegreeLat;
-        var dLon = dist * Math.Sin(rad) / (MetersPerDegreeLat * Math.Cos(obj.Lat * Math.PI / 180.0));
-        obj.Lat += dLat;
-        obj.Lon += dLon;
+        // Защита от деления на ~0 вблизи полюсов
+        var cosLat = Math.Max(0.01, Math.Cos(obj.Lat * Math.PI / 180.0));
+        var dLon = dist * Math.Sin(rad) / (MetersPerDegreeLat * cosLat);
+        obj.Lat = Math.Clamp(obj.Lat + dLat, _centerLat - _spreadDeg, _centerLat + _spreadDeg);
+        obj.Lon = Math.Clamp(obj.Lon + dLon, _centerLon - _spreadDeg, _centerLon + _spreadDeg);
     }
 
     /// <summary>Пуш позиции в broadcast-группу и группу объекта (не чаще 1/сек — тик и так 1с).</summary>
@@ -216,11 +222,24 @@ public class TrackSimulatorService : BackgroundService
                     "Симулятор: объект {ObjectId} — событие зоны {ZoneName} ({Type})",
                     obj.Id, dto.ZoneName, dto.Type);
 
+                // Payload = все поля ZoneEventDto + objectId (как в EventsController)
+                var payload = new
+                {
+                    id = dto.Id,
+                    zoneId = dto.ZoneId,
+                    zoneName = dto.ZoneName,
+                    type = dto.Type,
+                    occurredAt = dto.OccurredAt,
+                    lat = dto.Lat,
+                    lon = dto.Lon,
+                    objectId = obj.Id
+                };
+
                 await Task.WhenAll(
                     _hub.Clients.Group(TrackingHub.AllGroup)
-                        .SendAsync(TrackingHub.ZoneEvent, dto, ct),
+                        .SendAsync(TrackingHub.ZoneEvent, payload, ct),
                     _hub.Clients.Group(TrackingHub.ObjectGroup(obj.Id))
-                        .SendAsync(TrackingHub.ZoneEvent, dto, ct));
+                        .SendAsync(TrackingHub.ZoneEvent, payload, ct));
             }
         }
     }

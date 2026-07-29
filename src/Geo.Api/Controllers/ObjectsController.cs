@@ -57,24 +57,32 @@ public class ObjectsController : ControllerBase
             return Ok(await _queries.GetObjectsInBboxAsync(minLon, minLat, maxLon, maxLat, page, pageSize, ct));
         }
 
-        // Без bbox — все объекты (пагинация), последняя точка — через LEFT JOIN
+        // Без bbox — все объекты (пагинация), последняя точка — через LEFT JOIN.
+        // Проецируем сущности: ST_X/ST_Y над geography не существуют,
+        // координаты читаем в памяти после материализации.
         var query =
             from o in _db.TrackedObjects
             join p in LatestPoints() on o.Id equals p.ObjectId into lp
             from p in lp.DefaultIfEmpty()
-            select new TrackedObjectDto(
-                o.Id, o.Name, o.ExternalId, o.Kind, o.CreatedAt,
-                p != null ? p.Location.Y : (double?)null,
-                p != null ? p.Location.X : (double?)null,
-                p != null ? p.RecordedAt : (DateTimeOffset?)null);
+            select new { o, p };
 
         var total = await _db.TrackedObjects.CountAsync(ct);
-        var items = await query
-            .OrderBy(x => x.Name)
-            .ThenBy(x => x.Id)
+        // Сортировка — в SQL и ДО проекции в DTO (на полях сущности)
+        var rows = await query
+            .AsNoTracking()
+            .OrderBy(x => x.o.Name)
+            .ThenBy(x => x.o.Id)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync(ct);
+
+        var items = rows
+            .Select(x => new TrackedObjectDto(
+                x.o.Id, x.o.Name, x.o.ExternalId, x.o.Kind, x.o.CreatedAt,
+                x.p != null ? x.p.Location.Y : (double?)null,
+                x.p != null ? x.p.Location.X : (double?)null,
+                x.p != null ? x.p.RecordedAt : (DateTimeOffset?)null))
+            .ToList();
 
         return Ok(new PagedResult<TrackedObjectDto>(items, page, pageSize, total));
     }
@@ -83,19 +91,23 @@ public class ObjectsController : ControllerBase
     [HttpGet("{id:guid}")]
     public async Task<ActionResult<TrackedObjectDto>> GetById(Guid id, CancellationToken ct)
     {
-        var dto = await (
+        var row = await (
             from o in _db.TrackedObjects.Where(o => o.Id == id)
             join p in LatestPoints() on o.Id equals p.ObjectId into lp
             from p in lp.DefaultIfEmpty()
-            select new TrackedObjectDto(
-                o.Id, o.Name, o.ExternalId, o.Kind, o.CreatedAt,
-                p != null ? p.Location.Y : (double?)null,
-                p != null ? p.Location.X : (double?)null,
-                p != null ? p.RecordedAt : (DateTimeOffset?)null))
+            select new { o, p })
+            .AsNoTracking()
             .FirstOrDefaultAsync(ct);
 
-        if (dto is null)
+        if (row is null)
             return NotFoundProblem($"Объект {id} не найден");
+
+        // Координаты — в памяти (ST_X/ST_Y над geography не существуют)
+        var dto = new TrackedObjectDto(
+            row.o.Id, row.o.Name, row.o.ExternalId, row.o.Kind, row.o.CreatedAt,
+            row.p != null ? row.p.Location.Y : (double?)null,
+            row.p != null ? row.p.Location.X : (double?)null,
+            row.p != null ? row.p.RecordedAt : (DateTimeOffset?)null);
 
         return Ok(dto);
     }
