@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GeoTracker — живой трекинг</title>
+
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <!-- Leaflet 1.9 -->
+  <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet" />
+  <!-- Leaflet.draw 1.0.4 -->
+  <link href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" rel="stylesheet" />
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { padding-top: 56px; }                /* высота navbar */
+    #map { position: absolute; top: 56px; bottom: 0; left: 0; right: 0; }
+
+    /* Панель поверх карты справа */
+    #side-panel {
+      position: absolute; top: 66px; right: 10px; bottom: 10px;
+      width: 320px; z-index: 1000; overflow-y: auto;
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: .5rem; box-shadow: 0 2px 12px rgba(0, 0, 0, .25);
+      padding: .75rem;
+    }
+    #side-panel .card { border: 0; }
+    #events-list { max-height: 260px; overflow-y: auto; }
+    .event-item { font-size: .85rem; }
+
+    /* Тосты поверх карты */
+    #toast-container { z-index: 2000; }
+  </style>
+</head>
+<body>
+
+  <!-- ======================= Navbar ======================= -->
+  <nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
+    <div class="container-fluid">
+      <a class="navbar-brand fw-bold" href="#">GeoTracker</a>
+      <span class="navbar-text text-secondary d-none d-md-inline">живой трекинг объектов</span>
+      <div class="ms-auto d-flex align-items-center gap-2">
+        <span id="signalr-status" class="badge bg-secondary">SignalR: подключение…</span>
+        <button id="toggle-panel" class="btn btn-outline-light btn-sm" type="button">Панель</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ======================= Карта ======================= -->
+  <div id="map"></div>
+
+  <!-- ======================= Панель управления ======================= -->
+  <div id="side-panel">
+    <h6 class="text-muted mb-2">Мониторинг</h6>
+
+    <div class="mb-2">
+      Получено позиций: <span id="positions-count" class="badge bg-primary">0</span>
+    </div>
+
+    <!-- Выбор объекта / трек -->
+    <div class="mb-3">
+      <label for="object-select" class="form-label mb-1">Трек объекта</label>
+      <div class="input-group input-group-sm">
+        <select id="object-select" class="form-select">
+          <option value="">— выберите объект —</option>
+        </select>
+        <button id="clear-track" class="btn btn-outline-danger" type="button">Очистить трек</button>
+      </div>
+    </div>
+
+    <!-- Геозоны -->
+    <div class="mb-3">
+      <button id="load-zones" class="btn btn-sm btn-outline-success w-100" type="button">Загрузить зоны</button>
+      <div class="form-text">Новую зону можно нарисовать полигоном на карте.</div>
+    </div>
+
+    <!-- События зон -->
+    <h6 class="text-muted mb-1">События зон</h6>
+    <ul id="events-list" class="list-group list-group-flush"></ul>
+  </div>
+
+  <!-- Тосты -->
+  <div id="toast-container" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
+
+  <!-- ======================= Скрипты (CDN) ======================= -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+
+  <script>
+  $(function () {
+    'use strict';
+
+    // ==================== Карта и слои ====================
+    var map = L.map('map').setView([55.75, 37.62], 11); // Москва
+
+    var osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    var baseLayers = { 'OpenStreetMap': osm };
+    var overlays = {};
+
+    // Опциональный WMS-слой GeoServer (недоступность не должна ломать страницу)
+    try {
+      var wmsTracks = L.tileLayer.wms('http://localhost:8081/geoserver/geotracker/wms', {
+        layers: 'geotracker:track_points',
+        format: 'image/png',
+        transparent: true,
+        version: '1.1.1'
+      });
+      overlays['Треки (GeoServer WMS)'] = wmsTracks;
+    } catch (e) {
+      console.warn('WMS-слой GeoServer недоступен:', e);
+    }
+
+    L.control.layers(baseLayers, overlays, { position: 'topleft' }).addTo(map);
+
+    // Слои данных
+    var markers = {};                 // objectId -> circleMarker
+    var zonesLayer = L.geoJSON(null).addTo(map); // загруженные геозоны
+    var drawnItems = new L.FeatureGroup().addTo(map); // нарисованные зоны
+    var trackLine = null;             // полилиния трека
+
+    // ==================== Leaflet.draw (только полигоны) ====================
+    var drawControl = new L.Control.Draw({
+      position: 'topleft',
+      draw: {
+        polygon: { allowIntersection: false, shapeOptions: { color: '#ff7800' } },
+        polyline: false, rectangle: false, circle: false,
+        marker: false, circlemarker: false
+      },
+      edit: { featureGroup: drawnItems }
+    });
+    map.addControl(drawControl);
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+      var layer = e.layer;
+      var name = prompt('Название зоны');
+      if (!name) { return; } // отмена — зону не сохраняем
+
+      var geojson = layer.toGeoJSON().geometry;
+      $.ajax({
+        url: '/api/geozones',
+        method: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ name: name, color: '#ff7800', geoJson: geojson })
+      }).done(function (zone) {
+        drawnItems.addLayer(layer);
+        layer.bindPopup('Зона: ' + $('<div>').text(zone.name || name).html());
+        showToast('Зона «' + (zone.name || name) + '» сохранена', 'success');
+      }).fail(function (xhr) {
+        console.error('Не удалось сохранить зону', xhr);
+        showToast('Ошибка сохранения зоны', 'danger');
+      });
+    });
+
+    // ==================== Загрузка объектов ====================
+    $.getJSON('/api/objects?pageSize=500').done(function (res) {
+      var items = res.items || res.Items || [];
+      items.forEach(function (obj) {
+        addObjectOption(obj);
+        if (obj.lastLat != null && obj.lastLon != null) {
+          ensureMarker(obj.id, obj.name).setLatLng([obj.lastLat, obj.lastLon]);
+        }
+      });
+    }).fail(function () {
+      showToast('Не удалось загрузить объекты', 'danger');
+    });
+
+    function addObjectOption(obj) {
+      var $sel = $('#object-select');
+      if ($sel.find('option[value="' + obj.id + '"]').length === 0) {
+        $sel.append($('<option>').val(obj.id).text(obj.name));
+      }
+    }
+
+    // Маркер объекта: circleMarker с popup; создаётся лениво
+    function ensureMarker(objectId, name) {
+      if (!markers[objectId]) {
+        markers[objectId] = L.circleMarker([55.75, 37.62], {
+          radius: 7, color: '#2c7fb8', weight: 2,
+          fillColor: '#41b6c4', fillOpacity: 0.9
+        }).addTo(map);
+      }
+      if (name) { markers[objectId].bindPopup(name); }
+      return markers[objectId];
+    }
+
+    // ==================== SignalR ====================
+    var positionsReceived = 0;
+    var $status = $('#signalr-status');
+
+    function setStatus(text, css) {
+      $status.removeClass('bg-secondary bg-success bg-warning bg-danger')
+             .addClass(css).text(text);
+    }
+
+    var connection = new signalR.HubConnectionBuilder()
+      .withUrl('/hubs/tracking')
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on('positionUpdated', function (p) {
+      positionsReceived++;
+      $('#positions-count').text(positionsReceived);
+
+      var marker = ensureMarker(p.objectId);
+      marker.setLatLng([p.lat, p.lon]); // плавное движение за счёт частых обновлений
+
+      // если объекта ещё нет в select — добавим
+      addObjectOption({ id: p.objectId, name: 'Объект ' + String(p.objectId).slice(0, 8) });
+    });
+
+    connection.on('zoneEvent', function (ev) {
+      addEventItem(ev);
+      var verb = ev.type === 'Enter' ? 'вошёл в' : 'вышел из';
+      showToast('Объект ' + verb + ' зону «' + ev.zoneName + '»',
+                ev.type === 'Enter' ? 'success' : 'warning');
+    });
+
+    connection.onreconnecting(function () { setStatus('SignalR: переподключение…', 'bg-warning'); });
+    connection.onreconnected(function () { setStatus('SignalR: подключено', 'bg-success'); });
+    connection.onclose(function () { setStatus('SignalR: отключено', 'bg-danger'); });
+
+    connection.start()
+      .then(function () { setStatus('SignalR: подключено', 'bg-success'); })
+      .catch(function (err) {
+        console.error('SignalR:', err);
+        setStatus('SignalR: ошибка', 'bg-danger');
+      });
+
+    // ==================== События зон (список, макс 10) ====================
+    function addEventItem(ev) {
+      var verb = ev.type === 'Enter' ? 'вошёл в' : 'вышел из';
+      var time = new Date(ev.occurredAt).toLocaleTimeString('ru-RU');
+      var css = ev.type === 'Enter' ? 'list-group-item-success' : 'list-group-item-warning';
+      var $li = $('<li>').addClass('list-group-item event-item ' + css)
+        .text(time + ' — объект ' + String(ev.objectId || '').slice(0, 8) +
+              ' ' + verb + ' зону «' + ev.zoneName + '»');
+      $('#events-list').prepend($li);
+      $('#events-list li:gt(9)').remove(); // держим не больше 10
+    }
+
+    // Последние события из API при старте
+    $.getJSON('/api/events/recent?limit=10').done(function (events) {
+      (events || []).reverse().forEach(addEventItem);
+    });
+
+    // ==================== Геозоны: загрузка ====================
+    $('#load-zones').on('click', function () {
+      $.getJSON('/api/geozones').done(function (zones) {
+        zonesLayer.clearLayers();
+        (zones || []).forEach(function (z) {
+          if (!z.geoJson) { return; }
+          var layer = L.geoJSON(z.geoJson, {
+            style: { color: z.color || '#3388ff', weight: 2, fillOpacity: 0.15 }
+          });
+          layer.bindPopup('Зона: ' + $('<div>').text(z.name).html());
+          zonesLayer.addLayer(layer);
+        });
+        showToast('Зон загружено: ' + (zones || []).length, 'info');
+      }).fail(function () {
+        showToast('Не удалось загрузить зоны', 'danger');
+      });
+    });
+
+    // ==================== Трек выбранного объекта ====================
+    $('#object-select').on('change', function () {
+      var id = $(this).val();
+      clearTrack();
+      if (!id) { return; }
+
+      $.getJSON('/api/objects/' + id + '/track?pageSize=500').done(function (res) {
+        var items = res.items || [];
+        var latlngs = items.map(function (p) { return [p.lat, p.lon]; });
+        if (latlngs.length === 0) {
+          showToast('У объекта пока нет точек трека', 'info');
+          return;
+        }
+        trackLine = L.polyline(latlngs, { color: '#d95f02', weight: 3, opacity: 0.8 }).addTo(map);
+        map.fitBounds(trackLine.getBounds(), { padding: [30, 30] });
+      }).fail(function () {
+        showToast('Не удалось загрузить трек', 'danger');
+      });
+    });
+
+    $('#clear-track').on('click', clearTrack);
+
+    function clearTrack() {
+      if (trackLine) {
+        map.removeLayer(trackLine);
+        trackLine = null;
+      }
+    }
+
+    // ==================== Тосты ====================
+    function showToast(message, kind) {
+      var $toast = $(
+        '<div class="toast align-items-center text-bg-' + (kind || 'info') + ' border-0" role="alert">' +
+          '<div class="d-flex">' +
+            '<div class="toast-body"></div>' +
+            '<button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>' +
+          '</div>' +
+        '</div>');
+      $toast.find('.toast-body').text(message);
+      $('#toast-container').append($toast);
+      var toast = new bootstrap.Toast($toast[0], { delay: 3500 });
+      $toast.on('hidden.bs.toast', function () { $(this).remove(); });
+      toast.show();
+    }
+
+    // ==================== Сворачивание панели ====================
+    $('#toggle-panel').on('click', function () {
+      $('#side-panel').toggle();
+    });
+  });
+  </script>
+</body>
+</html>
