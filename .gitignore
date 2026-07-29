@@ -1,0 +1,9 @@
+bin/
+obj/
+out/
+.vs/
+.idea/
+*.user
+*.suo
+Dockerfile.original
+**/wwwroot/lib/

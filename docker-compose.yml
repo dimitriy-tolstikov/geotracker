@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: geotracker
+      POSTGRES_USER: geo
+      POSTGRES_PASSWORD: geo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geo -d geotracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Geo.Api/Dockerfile
+    environment:
+      ConnectionStrings__Default: "Host=db;Port=5432;Database=geotracker;Username=geo;Password=geo"
+      Simulator__Enabled: "true"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Бонус из вакансии: GeoServer для WMS/WFS поверх того же PostGIS.
+  # Запуск: docker compose --profile bonus up
+  geoserver:
+    image: kartoza/geoserver:2.24.2
+    profiles: ["bonus"]
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: geoserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
